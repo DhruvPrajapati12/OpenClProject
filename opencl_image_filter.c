@@ -91,15 +91,14 @@ int main(int argc, char **argv)
     }
 
     /* 7. Kernel */
-    size_t buffer_size = width * height * sizeof(cl_uchar4);
-    size_t total_pixels = buffer_size / sizeof(cl_uchar4);
-    size_t global = total_pixels;
+    size_t global = width * height;
 
-    cl_kernel kernel = clCreateKernel(program, "devide_by_two", &err);
+    cl_kernel kernel = clCreateKernel(program, "increase_brightness", &err);
 
     clSetKernelArg(kernel, 0, sizeof(cl_mem), &imgBuf);
-    clSetKernelArg(kernel, 1, sizeof(int), &((int){width}));
-    clSetKernelArg(kernel, 2, sizeof(int), &total_pixels);
+    // clSetKernelArg(kernel, 1, sizeof(int), &((int){width}));
+    clSetKernelArg(kernel, 1, sizeof(int), &global);
+    clSetKernelArg(kernel, 2, sizeof(char), "10");
 
     /* 8. Run kernel */
     
