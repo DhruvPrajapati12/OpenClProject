@@ -93,12 +93,12 @@ int main(int argc, char **argv)
     /* 7. Kernel */
     size_t global = width * height;
 
-    cl_kernel kernel = clCreateKernel(program, "increase_brightness", &err);
+    cl_kernel kernel = clCreateKernel(program, "grayscale", &err);
 
     clSetKernelArg(kernel, 0, sizeof(cl_mem), &imgBuf);
     // clSetKernelArg(kernel, 1, sizeof(int), &((int){width}));
     clSetKernelArg(kernel, 1, sizeof(int), &global);
-    clSetKernelArg(kernel, 2, sizeof(char), "10");
+    // clSetKernelArg(kernel, 2, sizeof(char), "10");
 
     /* 8. Run kernel */
     
