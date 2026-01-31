@@ -70,3 +70,27 @@ __kernel void invert_colors(__global uchar4 *img,
     img[id].y = 255 - img[id].y;
     img[id].z = 255 - img[id].z;
 }
+
+
+__kernel void left_half_grayscale(__global uchar4 *img,
+                                   int width,
+                                   int total_pixels)
+{
+    int id = get_global_id(0);
+
+    if (id >= total_pixels)
+        return;
+
+    int x = id % width;
+
+    if (x < width / 2) {
+        uchar4 p = img[id];
+        uchar gray = (p.x + p.y + p.z) / 3;
+
+        p.x = gray;
+        p.y = gray;
+        p.z = gray;
+
+        img[id] = p;
+    }
+}
