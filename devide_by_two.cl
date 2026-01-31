@@ -58,3 +58,15 @@ __kernel void grayscale(__global uchar4 *img,
     img[id] = p;
 }
 
+__kernel void invert_colors(__global uchar4 *img,
+                             int total_pixels)
+{
+    int id = get_global_id(0);
+
+    if (id >= total_pixels)
+        return;
+
+    img[id].x = 255 - img[id].x;
+    img[id].y = 255 - img[id].y;
+    img[id].z = 255 - img[id].z;
+}

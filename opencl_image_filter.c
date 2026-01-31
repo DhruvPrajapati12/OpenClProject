@@ -93,7 +93,7 @@ int main(int argc, char **argv)
     /* 7. Kernel */
     size_t global = width * height;
 
-    cl_kernel kernel = clCreateKernel(program, "grayscale", &err);
+    cl_kernel kernel = clCreateKernel(program, "invert_colors", &err);
 
     clSetKernelArg(kernel, 0, sizeof(cl_mem), &imgBuf);
     // clSetKernelArg(kernel, 1, sizeof(int), &((int){width}));
