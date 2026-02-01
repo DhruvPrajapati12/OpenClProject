@@ -24,6 +24,7 @@ GST_DEBUG_CATEGORY_STATIC(gst_opencl_filter_debug);
 typedef struct _GstOpenCLFilter {
     GstVideoFilter parent;
 
+    /* OpenCL */
     cl_platform_id platform;
     cl_device_id device;
     cl_context context;
@@ -34,17 +35,27 @@ typedef struct _GstOpenCLFilter {
     cl_mem ybuf;
     size_t buf_size;
 
+    /* Video info */
     gint width;
     gint height;
     gint stride;
 
     gboolean cl_ready;
     guint64 frame_count;
+
+    /* Property */
+    gchar *kernel_file;
+
 } GstOpenCLFilter;
 
 typedef struct _GstOpenCLFilterClass {
     GstVideoFilterClass parent_class;
 } GstOpenCLFilterClass;
+
+enum {
+    PROP_0,
+    PROP_KERNEL_FILE,
+};
 
 #define GST_TYPE_OPENCL_FILTER (gst_opencl_filter_get_type())
 G_DEFINE_TYPE(GstOpenCLFilter, gst_opencl_filter, GST_TYPE_VIDEO_FILTER)
@@ -89,6 +100,18 @@ static char *load_file(const char *path)
         goto error; \
     }
 
+static gchar *
+load_kernel_file(const gchar *path)
+{
+    gchar *data = NULL;
+    gsize size = 0;
+
+    if (!g_file_get_contents(path, &data, &size, NULL))
+        return NULL;
+
+    return data;
+}
+
 /* ================= OPENCL INIT ================= */
 static gboolean
 gst_opencl_filter_set_info(GstVideoFilter *filter,
@@ -96,6 +119,14 @@ gst_opencl_filter_set_info(GstVideoFilter *filter,
                            GstCaps *outcaps, GstVideoInfo *outinfo)
 {
     GstOpenCLFilter *self = (GstOpenCLFilter *)filter;
+
+    if (!self->kernel_file || !g_file_test(self->kernel_file, G_FILE_TEST_EXISTS)) {
+        GST_INFO_OBJECT(self,
+            "No kernel-file provided, running in bypass mode");
+        self->cl_ready = FALSE;
+        return TRUE;
+    }
+
     cl_int err;
 
     GST_INFO_OBJECT(self, "Initializing OpenCL");
@@ -116,11 +147,19 @@ gst_opencl_filter_set_info(GstVideoFilter *filter,
                     self->context, self->device, NULL, &err);
     CHECK_CL(err, "clCreateCommandQueueWithProperties");
 
-    char *kernel_src = load_file("/home/kyoto/dhruv/Oscar/OpenCL/OpenCLProject/nv12_half_left.cl");
-    if (!kernel_src)
-    {
-        GST_ERROR_OBJECT(self, "Failed to load OpenCL kernel file");
-        return FALSE;
+    // char *kernel_src = load_file("/home/kyoto/dhruv/Oscar/OpenCL/OpenCLProject/nv12_half_left.cl");
+    // if (!kernel_src)
+    // {
+    //     GST_ERROR_OBJECT(self, "Failed to load OpenCL kernel file");
+    //     return FALSE;
+    // }
+
+    gchar *kernel_src = load_kernel_file(self->kernel_file);
+    if (!kernel_src) {
+        GST_ERROR_OBJECT(self,
+            "Failed to load kernel file: %s", self->kernel_file);
+        self->cl_ready = FALSE;
+        return TRUE; /* bypass */
     }
 
     self->program = clCreateProgramWithSource(
@@ -246,6 +285,52 @@ error:
     return GST_FLOW_ERROR;
 }
 
+static void
+gst_opencl_filter_set_property(GObject *object,
+                               guint prop_id,
+                               const GValue *value,
+                               GParamSpec *pspec)
+{
+    GstOpenCLFilter *self = (GstOpenCLFilter *)object;
+
+    switch (prop_id) {
+    case PROP_KERNEL_FILE:
+        g_free(self->kernel_file);
+        self->kernel_file = g_value_dup_string(value);
+
+        GST_INFO_OBJECT(self,
+            "kernel-file set to: %s",
+            self->kernel_file ? self->kernel_file : "(null)");
+
+        /* Force re-init on next set_info */
+        self->cl_ready = FALSE;
+        break;
+
+    default:
+        G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+        break;
+    }
+}
+
+static void
+gst_opencl_filter_get_property(GObject *object,
+                               guint prop_id,
+                               GValue *value,
+                               GParamSpec *pspec)
+{
+    GstOpenCLFilter *self = (GstOpenCLFilter *)object;
+
+    switch (prop_id) {
+    case PROP_KERNEL_FILE:
+        g_value_set_string(value, self->kernel_file);
+        break;
+
+    default:
+        G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+        break;
+    }
+}
+
 /* ================= FINALIZE ================= */
 static void
 gst_opencl_filter_finalize(GObject *object)
@@ -258,6 +343,7 @@ gst_opencl_filter_finalize(GObject *object)
     if (self->queue)   clReleaseCommandQueue(self->queue);
     if (self->context) clReleaseContext(self->context);
 
+    g_clear_pointer(&self->kernel_file, g_free);
     G_OBJECT_CLASS(gst_opencl_filter_parent_class)->finalize(object);
 }
 
@@ -269,6 +355,7 @@ gst_opencl_filter_init(GstOpenCLFilter *self)
     self->frame_count = 0;
     self->ybuf = NULL;
     self->buf_size = 0;
+    self->kernel_file = NULL;
 }
 
 static void
@@ -297,7 +384,22 @@ gst_opencl_filter_class_init(GstOpenCLFilterClass *klass)
         "OpenCL NV12 Filter",
         "Filter/Video",
         "Applies OpenCL processing on NV12 video",
-        "Custom");
+        "Dhruv Prajapati");
+
+    gclass->set_property = gst_opencl_filter_set_property;
+    gclass->get_property = gst_opencl_filter_get_property;
+
+    g_object_class_install_property(
+        gclass,
+        PROP_KERNEL_FILE,
+        g_param_spec_string(
+            "kernel-file",
+            "OpenCL kernel file",
+            "Path to OpenCL kernel file (.cl). "
+            "If not set, filter runs in bypass mode.",
+            NULL,  /* default */
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
 }
 
 /* ================= PLUGIN ================= */
@@ -321,3 +423,4 @@ GST_PLUGIN_DEFINE(
     PACKAGE,
     PACKAGE
 )
+
