@@ -45,6 +45,7 @@ typedef struct _GstOpenCLFilter {
 
     /* Property */
     gchar *kernel_file;
+    gchar *kernel_func;
 
 } GstOpenCLFilter;
 
@@ -55,6 +56,7 @@ typedef struct _GstOpenCLFilterClass {
 enum {
     PROP_0,
     PROP_KERNEL_FILE,
+    PROP_KERNEL_FUNC,
 };
 
 #define GST_TYPE_OPENCL_FILTER (gst_opencl_filter_get_type())
@@ -120,9 +122,9 @@ gst_opencl_filter_set_info(GstVideoFilter *filter,
 {
     GstOpenCLFilter *self = (GstOpenCLFilter *)filter;
 
-    if (!self->kernel_file || !g_file_test(self->kernel_file, G_FILE_TEST_EXISTS)) {
+    if (!self->kernel_file || !g_file_test(self->kernel_file, G_FILE_TEST_EXISTS) || !self->kernel_func) {
         GST_INFO_OBJECT(self,
-            "No kernel-file provided, running in bypass mode");
+            "kernel-file or kernel-func not set, running in bypass mode");
         self->cl_ready = FALSE;
         return TRUE;
     }
@@ -181,7 +183,7 @@ gst_opencl_filter_set_info(GstVideoFilter *filter,
     }
 
     self->kernel = clCreateKernel(
-                        self->program, "nv12_half_left", &err);
+                        self->program, self->kernel_func, &err);
     CHECK_CL(err, "clCreateKernel");
 
     self->cl_ready = TRUE;
@@ -294,21 +296,33 @@ gst_opencl_filter_set_property(GObject *object,
     GstOpenCLFilter *self = (GstOpenCLFilter *)object;
 
     switch (prop_id) {
-    case PROP_KERNEL_FILE:
-        g_free(self->kernel_file);
-        self->kernel_file = g_value_dup_string(value);
+        case PROP_KERNEL_FILE:
+            g_free(self->kernel_file);
+            self->kernel_file = g_value_dup_string(value);
 
-        GST_INFO_OBJECT(self,
-            "kernel-file set to: %s",
-            self->kernel_file ? self->kernel_file : "(null)");
+            GST_INFO_OBJECT(self,
+                "kernel-file set to: %s",
+                self->kernel_file ? self->kernel_file : "(null)");
 
-        /* Force re-init on next set_info */
-        self->cl_ready = FALSE;
-        break;
+            /* Force re-init on next set_info */
+            self->cl_ready = FALSE;
+            break;
 
-    default:
-        G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
-        break;
+        case PROP_KERNEL_FUNC:
+            g_free(self->kernel_func);
+            self->kernel_func = g_value_dup_string(value);
+
+            GST_INFO_OBJECT(self,
+                "kernel-func set to: %s",
+                self->kernel_func ? self->kernel_func : "(null)");
+
+            /* Force re-init on next set_info */
+            self->cl_ready = FALSE;
+            break;
+
+        default:
+            G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+            break;
     }
 }
 
@@ -323,6 +337,10 @@ gst_opencl_filter_get_property(GObject *object,
     switch (prop_id) {
     case PROP_KERNEL_FILE:
         g_value_set_string(value, self->kernel_file);
+        break;
+
+    case PROP_KERNEL_FUNC:
+        g_value_set_string(value, self->kernel_func);
         break;
 
     default:
@@ -344,6 +362,8 @@ gst_opencl_filter_finalize(GObject *object)
     if (self->context) clReleaseContext(self->context);
 
     g_clear_pointer(&self->kernel_file, g_free);
+    g_clear_pointer(&self->kernel_func, g_free);
+
     G_OBJECT_CLASS(gst_opencl_filter_parent_class)->finalize(object);
 }
 
@@ -356,6 +376,7 @@ gst_opencl_filter_init(GstOpenCLFilter *self)
     self->ybuf = NULL;
     self->buf_size = 0;
     self->kernel_file = NULL;
+    self->kernel_func = NULL;
 }
 
 static void
@@ -398,6 +419,16 @@ gst_opencl_filter_class_init(GstOpenCLFilterClass *klass)
             "Path to OpenCL kernel file (.cl). "
             "If not set, filter runs in bypass mode.",
             NULL,  /* default */
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+    g_object_class_install_property(
+        gclass,
+        PROP_KERNEL_FUNC,
+        g_param_spec_string(
+            "kernel-func",
+            "OpenCL kernel function",
+            "Kernel function name inside the OpenCL program",
+            NULL,
             G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
 }
