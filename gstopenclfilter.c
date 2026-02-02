@@ -114,6 +114,12 @@ load_kernel_file(const gchar *path)
     return data;
 }
 
+cl_queue_properties props[] = {
+    CL_QUEUE_PROPERTIES,
+    CL_QUEUE_PROFILING_ENABLE,
+    0
+};
+
 /* ================= OPENCL INIT ================= */
 static gboolean
 gst_opencl_filter_set_info(GstVideoFilter *filter,
@@ -140,13 +146,29 @@ gst_opencl_filter_set_info(GstVideoFilter *filter,
                           1, &self->device, NULL);
     CHECK_CL(err, "clGetDeviceIDs");
 
+    cl_device_type type;
+    clGetDeviceInfo(
+        self->device,
+        CL_DEVICE_TYPE,
+        sizeof(type),
+        &type,
+        NULL
+    );
+
+    if (type & CL_DEVICE_TYPE_GPU)
+        GST_DEBUG_OBJECT(self, "Running on GPU\n");
+    else if (type & CL_DEVICE_TYPE_CPU)
+        GST_DEBUG_OBJECT(self, "Running on CPU\n");
+    else
+        GST_DEBUG_OBJECT(self, "Other device type\n");
+
     self->context = clCreateContext(NULL, 1,
                                     &self->device,
                                     NULL, NULL, &err);
     CHECK_CL(err, "clCreateContext");
 
     self->queue = clCreateCommandQueueWithProperties(
-                    self->context, self->device, NULL, &err);
+                    self->context, self->device, props, &err);
     CHECK_CL(err, "clCreateCommandQueueWithProperties");
 
     // char *kernel_src = load_file("/home/kyoto/dhruv/Oscar/OpenCL/OpenCLProject/nv12_half_left.cl");
@@ -262,12 +284,37 @@ gst_opencl_filter_transform_frame(GstVideoFilter *filter,
 
     GST_DEBUG_OBJECT(self, "Enqueue kernel global=(%zu x %zu)", global[0], global[1]);
 
+    cl_event kernel_event;
+
     err = clEnqueueNDRangeKernel(self->queue,
                                  self->kernel,
                                  2, NULL,
                                  global, NULL,
-                                 0, NULL, NULL);
+                                 0, NULL, &kernel_event);
     CHECK_CL(err, "clEnqueueNDRangeKernel");
+
+    /* Wait for kernel to finish */
+    clWaitForEvents(1, &kernel_event);
+
+    cl_ulong start = 0, end = 0;
+    clGetEventProfilingInfo(
+        kernel_event,
+        CL_PROFILING_COMMAND_START,
+        sizeof(cl_ulong),
+        &start,
+        NULL
+    );
+
+    clGetEventProfilingInfo(
+        kernel_event,
+        CL_PROFILING_COMMAND_END,
+        sizeof(cl_ulong),
+        &end,
+        NULL
+    );
+
+    double gpu_time_ms = (end - start) * 1e-6;  // ns → ms
+    GST_ERROR_OBJECT(self, "GPU kernel time: %.3f ms\n", gpu_time_ms);
 
     err = clFinish(self->queue);
     CHECK_CL(err, "clFinish");
