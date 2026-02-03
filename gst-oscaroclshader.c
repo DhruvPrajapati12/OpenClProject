@@ -1,10 +1,10 @@
-#ifndef PACKAGE
-#define PACKAGE "gstopenclfilter"
-#endif
-
-#ifndef VERSION
-#define VERSION "1.0"
-#endif
+/*
+ * gst-oscaroclshader.c
+ *
+ * A minimal GstBaseTransform video filter
+ * Accepts NV12 video/x-raw
+ *
+ */
 
 #define CL_TARGET_OPENCL_VERSION 300 // Targets OpenCL 3.0
 
@@ -12,16 +12,24 @@
 #include <gst/video/gstvideofilter.h>
 #include <gst/video/video.h>
 #include <CL/cl.h>
-#include <string.h>
 #include <stdio.h>
 
+#ifndef PACKAGE
+#define PACKAGE "oscaroclshader"
+#endif
 
-/* ================= DEBUG ================= */
-GST_DEBUG_CATEGORY_STATIC(gst_opencl_filter_debug);
-#define GST_CAT_DEFAULT gst_opencl_filter_debug
+#ifndef VERSION
+#define VERSION "1.0"
+#endif
+
+#define NUM_BUFFERS 2
+
+/* Debug category for GstOCLShader logging. */
+GST_DEBUG_CATEGORY_STATIC(gst_ocl_shader_debug);
+#define GST_CAT_DEFAULT gst_ocl_shader_debug
 
 /* ================= OBJECT ================= */
-typedef struct _GstOpenCLFilter {
+typedef struct _GstOCLShader {
     GstVideoFilter parent;
 
     /* OpenCL */
@@ -32,8 +40,14 @@ typedef struct _GstOpenCLFilter {
     cl_program program;
     cl_kernel kernel;
 
-    cl_mem ybuf;
+    /* Double-buffered GPU memory */
+    cl_mem ybuf[NUM_BUFFERS];
     size_t buf_size;
+
+    /* Events per buffer */
+    cl_event write_evt[NUM_BUFFERS];
+    cl_event kernel_evt[NUM_BUFFERS];
+    cl_event read_evt[NUM_BUFFERS];
 
     /* Video info */
     gint width;
@@ -43,58 +57,60 @@ typedef struct _GstOpenCLFilter {
     gboolean cl_ready;
     guint64 frame_count;
 
-    /* Property */
+    /* OpenCL Property */
     gchar *kernel_file;
     gchar *kernel_func;
 
-} GstOpenCLFilter;
+} GstOCLShader;
 
-typedef struct _GstOpenCLFilterClass {
+/* Class definition for the GstOCLShader element. */
+typedef struct _GstOCLShaderClass {
     GstVideoFilterClass parent_class;
-} GstOpenCLFilterClass;
+} GstOCLShaderClass;
 
+/* Property identifiers used to configure the OpenCL kernel file and function. */
 enum {
     PROP_0,
     PROP_KERNEL_FILE,
     PROP_KERNEL_FUNC,
 };
 
-#define GST_TYPE_OPENCL_FILTER (gst_opencl_filter_get_type())
-G_DEFINE_TYPE(GstOpenCLFilter, gst_opencl_filter, GST_TYPE_VIDEO_FILTER)
+/* GObject type macro for the GstOCLShader element. */
+#define GST_TYPE_OCL_SHADER (gst_ocl_shader_get_type())
+/* Register GstOCLShader as a GstVideoFilter subclass with the type system. */
+G_DEFINE_TYPE(GstOCLShader, gst_ocl_shader, GST_TYPE_VIDEO_FILTER)
 
-/* ================= CAPS ================= */
+/* Sink Pad supports NV12 */
 static GstStaticPadTemplate sink_template =
 GST_STATIC_PAD_TEMPLATE(
     "sink",
     GST_PAD_SINK,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS("video/x-raw, format=(string)NV12")
+    GST_STATIC_CAPS(
+        "video/x-raw, "
+        "format = (string) NV12, "
+        "width = (int) [ 1, MAX ], "
+        "height = (int) [ 1, MAX ], "
+        "framerate = (fraction) [ 0/1, MAX ]"
+    )
 );
 
+/* Source Pad supports NV12 */
 static GstStaticPadTemplate src_template =
 GST_STATIC_PAD_TEMPLATE(
     "src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS("video/x-raw, format=(string)NV12")
+    GST_STATIC_CAPS(
+        "video/x-raw, "
+        "format = (string) NV12, "
+        "width = (int) [ 1, MAX ], "
+        "height = (int) [ 1, MAX ], "
+        "framerate = (fraction) [ 0/1, MAX ]"
+    )
 );
 
 /* ================= HELPERS ================= */
-static char *load_file(const char *path)
-{
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return NULL;
-
-    fseek(fp, 0, SEEK_END);
-    long size = ftell(fp);
-    rewind(fp);
-
-    char *buf = g_malloc(size + 1);
-    fread(buf, 1, size, fp);
-    buf[size] = 0;
-    fclose(fp);
-    return buf;
-}
 
 #define CHECK_CL(err, msg) \
     if ((err) != CL_SUCCESS) { \
@@ -102,6 +118,7 @@ static char *load_file(const char *path)
         goto error; \
     }
 
+/* Load entire OpenCL kernel source file into a memory buffer. */
 static gchar *
 load_kernel_file(const gchar *path)
 {
@@ -114,25 +131,25 @@ load_kernel_file(const gchar *path)
     return data;
 }
 
+/* OpenCL queue with profiling enabled. */
 cl_queue_properties props[] = {
     CL_QUEUE_PROPERTIES,
     CL_QUEUE_PROFILING_ENABLE,
     0
 };
 
-/* ================= OPENCL INIT ================= */
+/* ================= OPENCL INITIALIZATION =================*/
 static gboolean
-gst_opencl_filter_set_info(GstVideoFilter *filter,
+gst_ocl_shader_set_info(GstVideoFilter *filter,
                            GstCaps *incaps, GstVideoInfo *ininfo,
                            GstCaps *outcaps, GstVideoInfo *outinfo)
 {
-    GstOpenCLFilter *self = (GstOpenCLFilter *)filter;
+    GstOCLShader *self = (GstOCLShader *)filter;
 
     if (!self->kernel_file || !g_file_test(self->kernel_file, G_FILE_TEST_EXISTS) || !self->kernel_func) {
-        GST_INFO_OBJECT(self,
+        GST_ERROR_OBJECT(self,
             "kernel-file or kernel-func not set, running in bypass mode");
-        self->cl_ready = FALSE;
-        return TRUE;
+        goto error;
     }
 
     cl_int err;
@@ -146,22 +163,6 @@ gst_opencl_filter_set_info(GstVideoFilter *filter,
                           1, &self->device, NULL);
     CHECK_CL(err, "clGetDeviceIDs");
 
-    cl_device_type type;
-    clGetDeviceInfo(
-        self->device,
-        CL_DEVICE_TYPE,
-        sizeof(type),
-        &type,
-        NULL
-    );
-
-    if (type & CL_DEVICE_TYPE_GPU)
-        GST_DEBUG_OBJECT(self, "Running on GPU\n");
-    else if (type & CL_DEVICE_TYPE_CPU)
-        GST_DEBUG_OBJECT(self, "Running on CPU\n");
-    else
-        GST_DEBUG_OBJECT(self, "Other device type\n");
-
     self->context = clCreateContext(NULL, 1,
                                     &self->device,
                                     NULL, NULL, &err);
@@ -171,19 +172,11 @@ gst_opencl_filter_set_info(GstVideoFilter *filter,
                     self->context, self->device, props, &err);
     CHECK_CL(err, "clCreateCommandQueueWithProperties");
 
-    // char *kernel_src = load_file("/home/kyoto/dhruv/Oscar/OpenCL/OpenCLProject/nv12_half_left.cl");
-    // if (!kernel_src)
-    // {
-    //     GST_ERROR_OBJECT(self, "Failed to load OpenCL kernel file");
-    //     return FALSE;
-    // }
-
     gchar *kernel_src = load_kernel_file(self->kernel_file);
     if (!kernel_src) {
         GST_ERROR_OBJECT(self,
             "Failed to load kernel file: %s", self->kernel_file);
-        self->cl_ready = FALSE;
-        return TRUE; /* bypass */
+        goto error;
     }
 
     self->program = clCreateProgramWithSource(
@@ -212,7 +205,7 @@ gst_opencl_filter_set_info(GstVideoFilter *filter,
     return TRUE;
 
 error:
-    GST_WARNING_OBJECT(self,
+    GST_ERROR_OBJECT(self,
         "OpenCL unavailable, running in bypass mode");
     self->cl_ready = FALSE;
     return TRUE; /* Allow pipeline to continue */
@@ -220,11 +213,11 @@ error:
 
 /* ================= FRAME PROCESS ================= */
 static GstFlowReturn
-gst_opencl_filter_transform_frame(GstVideoFilter *filter,
+gst_ocl_shader_transform_frame(GstVideoFilter *filter,
                                   GstVideoFrame *in,
                                   GstVideoFrame *out)
 {
-    GstOpenCLFilter *self = (GstOpenCLFilter *)filter;
+    GstOCLShader *self = (GstOCLShader *)filter;
     cl_int err;
 
     gst_video_frame_copy(out, in);
@@ -242,19 +235,24 @@ gst_opencl_filter_transform_frame(GstVideoFilter *filter,
     gint stride = GST_VIDEO_FRAME_PLANE_STRIDE(out, 0);
 
     size_t size = stride * height;
+    int idx = self->frame_count % NUM_BUFFERS;
 
-    GST_DEBUG_OBJECT(self, "Frame info: %dx%d stride=%d", width, height, stride);
-    guint8 before = y[0];
+    /* Reallocate buffers on caps change */
+    if (size != self->buf_size) {
+        for (int i = 0; i < NUM_BUFFERS; i++) {
+            if (self->ybuf[i]) {
+                clReleaseMemObject(self->ybuf[i]);
+                self->ybuf[i] = NULL;
+            }
+        }
 
-    /* Reallocate buffer if format changed */
-    if (!self->ybuf || size != self->buf_size) {
-        if (self->ybuf)
-            clReleaseMemObject(self->ybuf);
-
-        self->ybuf = clCreateBuffer(self->context,
-                                    CL_MEM_READ_WRITE,
-                                    size, NULL, &err);
-        CHECK_CL(err, "clCreateBuffer");
+        for (int i = 0; i < NUM_BUFFERS; i++) {
+            self->ybuf[i] = clCreateBuffer(
+                self->context,
+                CL_MEM_READ_WRITE,
+                size, NULL, &err);
+            CHECK_CL(err, "clCreateBuffer");
+        }
 
         self->buf_size = size;
         self->width = width;
@@ -262,13 +260,20 @@ gst_opencl_filter_transform_frame(GstVideoFilter *filter,
         self->stride = stride;
     }
 
+    /* Cleanup old events */
+    if (self->write_evt[idx])  clReleaseEvent(self->write_evt[idx]);
+    if (self->kernel_evt[idx]) clReleaseEvent(self->kernel_evt[idx]);
+    if (self->read_evt[idx])   clReleaseEvent(self->read_evt[idx]);
+
+    /* Non-blocking write */
     err = clEnqueueWriteBuffer(self->queue,
-                               self->ybuf, CL_TRUE,
+                               self->ybuf[idx], CL_FALSE,
                                0, size, y,
-                               0, NULL, NULL);
+                               0, NULL, &self->write_evt[idx]);
     CHECK_CL(err, "clEnqueueWriteBuffer");
 
-    err = clSetKernelArg(self->kernel, 0, sizeof(cl_mem), &self->ybuf);
+    /* OpenCL Kernel Argument, Modify this code if you are adding new arguments into OpenCL kernel function. */
+    err = clSetKernelArg(self->kernel, 0, sizeof(cl_mem), &self->ybuf[idx]);
     CHECK_CL(err, "clSetKernelArg(0)");
     err = clSetKernelArg(self->kernel, 1, sizeof(int), &width);
     CHECK_CL(err, "clSetKernelArg(1)");
@@ -277,56 +282,32 @@ gst_opencl_filter_transform_frame(GstVideoFilter *filter,
     err = clSetKernelArg(self->kernel, 3, sizeof(int), &stride);
     CHECK_CL(err, "clSetKernelArg(3)");
 
-    // clSetKernelArg(self->kernel, 4, sizeof(char), "10");
-    // CHECK_CL(err, "clSetKernelArg(4)");
-
     size_t global[2] = { width, height };
 
     GST_DEBUG_OBJECT(self, "Enqueue kernel global=(%zu x %zu)", global[0], global[1]);
 
-    cl_event kernel_event;
-
+    /* Kernel depends on write */
     err = clEnqueueNDRangeKernel(self->queue,
                                  self->kernel,
                                  2, NULL,
                                  global, NULL,
-                                 0, NULL, &kernel_event);
+                                 1, &self->write_evt[idx],
+                                 &self->kernel_evt[idx]);
     CHECK_CL(err, "clEnqueueNDRangeKernel");
-
-    /* Wait for kernel to finish */
-    clWaitForEvents(1, &kernel_event);
-
-    cl_ulong start = 0, end = 0;
-    clGetEventProfilingInfo(
-        kernel_event,
-        CL_PROFILING_COMMAND_START,
-        sizeof(cl_ulong),
-        &start,
-        NULL
-    );
-
-    clGetEventProfilingInfo(
-        kernel_event,
-        CL_PROFILING_COMMAND_END,
-        sizeof(cl_ulong),
-        &end,
-        NULL
-    );
-
-    double gpu_time_ms = (end - start) * 1e-6;  // ns → ms
-    GST_ERROR_OBJECT(self, "GPU kernel time: %.3f ms\n", gpu_time_ms);
 
     err = clFinish(self->queue);
     CHECK_CL(err, "clFinish");
 
+    /* Read depends on kernel */
     err = clEnqueueReadBuffer(self->queue,
-                              self->ybuf, CL_TRUE,
+                              self->ybuf[idx], CL_FALSE,
                               0, size, y,
-                              0, NULL, NULL);
+                              1, &self->kernel_evt[idx],
+                                &self->read_evt[idx]);
     CHECK_CL(err, "clEnqueueReadBuffer");
 
-    guint8 after = y[0];
-    GST_LOG_OBJECT(self, "Y[0] before=%u after=%u", before, after);
+    /* Allow GPU to run asynchronously */
+    clFlush(self->queue);
 
     return GST_FLOW_OK;
 error:
@@ -335,12 +316,12 @@ error:
 }
 
 static void
-gst_opencl_filter_set_property(GObject *object,
+gst_ocl_shader_set_property(GObject *object,
                                guint prop_id,
                                const GValue *value,
                                GParamSpec *pspec)
 {
-    GstOpenCLFilter *self = (GstOpenCLFilter *)object;
+    GstOCLShader *self = (GstOCLShader *)object;
 
     switch (prop_id) {
         case PROP_KERNEL_FILE:
@@ -374,12 +355,12 @@ gst_opencl_filter_set_property(GObject *object,
 }
 
 static void
-gst_opencl_filter_get_property(GObject *object,
+gst_ocl_shader_get_property(GObject *object,
                                guint prop_id,
                                GValue *value,
                                GParamSpec *pspec)
 {
-    GstOpenCLFilter *self = (GstOpenCLFilter *)object;
+    GstOCLShader *self = (GstOCLShader *)object;
 
     switch (prop_id) {
     case PROP_KERNEL_FILE:
@@ -396,66 +377,119 @@ gst_opencl_filter_get_property(GObject *object,
     }
 }
 
-/* ================= FINALIZE ================= */
 static void
-gst_opencl_filter_finalize(GObject *object)
+gst_ocl_shader_finalize(GObject *object)
 {
-    GstOpenCLFilter *self = (GstOpenCLFilter *)object;
+    GstOCLShader *self = (GstOCLShader *)object;
 
-    if (self->ybuf)    clReleaseMemObject(self->ybuf);
-    if (self->kernel)  clReleaseKernel(self->kernel);
-    if (self->program) clReleaseProgram(self->program);
-    if (self->queue)   clReleaseCommandQueue(self->queue);
-    if (self->context) clReleaseContext(self->context);
+    GST_DEBUG_OBJECT(self, "Finalizing OpenCL filter");
 
+    /* Release OpenCL events */
+    for (int i = 0; i < NUM_BUFFERS; i++) {
+        if (self->write_evt[i]) {
+            clReleaseEvent(self->write_evt[i]);
+            self->write_evt[i] = NULL;
+        }
+        if (self->kernel_evt[i]) {
+            clReleaseEvent(self->kernel_evt[i]);
+            self->kernel_evt[i] = NULL;
+        }
+        if (self->read_evt[i]) {
+            clReleaseEvent(self->read_evt[i]);
+            self->read_evt[i] = NULL;
+        }
+    }
+
+    /* Release OpenCL buffers */
+    for (int i = 0; i < NUM_BUFFERS; i++) {
+        if (self->ybuf[i]) {
+            clReleaseMemObject(self->ybuf[i]);
+            self->ybuf[i] = NULL;
+        }
+    }
+
+    /* Release OpenCL kernel/program/queue/context */
+    if (self->kernel) {
+        clReleaseKernel(self->kernel);
+        self->kernel = NULL;
+    }
+
+    if (self->program) {
+        clReleaseProgram(self->program);
+        self->program = NULL;
+    }
+
+    if (self->queue) {
+        clReleaseCommandQueue(self->queue);
+        self->queue = NULL;
+    }
+
+    if (self->context) {
+        clReleaseContext(self->context);
+        self->context = NULL;
+    }
+
+    /* Free GObject properties */
     g_clear_pointer(&self->kernel_file, g_free);
     g_clear_pointer(&self->kernel_func, g_free);
 
-    G_OBJECT_CLASS(gst_opencl_filter_parent_class)->finalize(object);
+    /* Chain up to parent class */
+    G_OBJECT_CLASS(gst_ocl_shader_parent_class)->finalize(object);
 }
 
-/* ================= INIT ================= */
+
+/* Instance initialization */
 static void
-gst_opencl_filter_init(GstOpenCLFilter *self)
+gst_ocl_shader_init(GstOCLShader *self)
 {
     self->cl_ready = FALSE;
     self->frame_count = 0;
-    self->ybuf = NULL;
     self->buf_size = 0;
     self->kernel_file = NULL;
     self->kernel_func = NULL;
+
+    for (int i = 0; i < NUM_BUFFERS; i++) {
+        self->ybuf[i] = NULL;
+        self->write_evt[i] = NULL;
+        self->kernel_evt[i] = NULL;
+        self->read_evt[i] = NULL;
+    }
 }
 
+/* Class initialization */
 static void
-gst_opencl_filter_class_init(GstOpenCLFilterClass *klass)
+gst_ocl_shader_class_init(GstOCLShaderClass *klass)
 {
     GstElementClass *eclass = GST_ELEMENT_CLASS(klass);
     GstVideoFilterClass *vclass = GST_VIDEO_FILTER_CLASS(klass);
     GObjectClass *gclass = G_OBJECT_CLASS(klass);
 
-    GST_DEBUG_CATEGORY_INIT(gst_opencl_filter_debug,
-                            "openclfilter", 0,
-                            "OpenCL NV12 video filter");
+    GST_DEBUG_CATEGORY_INIT(gst_ocl_shader_debug,
+                            "oscaroclshader", 0,
+                            "OpenCL NV12 Shader");
 
-    gclass->finalize = gst_opencl_filter_finalize;
-    vclass->set_info = GST_DEBUG_FUNCPTR(gst_opencl_filter_set_info);
+    /* BaseTransform virtual functions */
+    gclass->finalize = gst_ocl_shader_finalize;
+    vclass->set_info = GST_DEBUG_FUNCPTR(gst_ocl_shader_set_info);
     vclass->transform_frame =
-        GST_DEBUG_FUNCPTR(gst_opencl_filter_transform_frame);
+        GST_DEBUG_FUNCPTR(gst_ocl_shader_transform_frame);
 
+    /* Add pad templates */
     gst_element_class_add_pad_template(
         eclass, gst_static_pad_template_get(&sink_template));
     gst_element_class_add_pad_template(
         eclass, gst_static_pad_template_get(&src_template));
 
+    /* Element metadata */
     gst_element_class_set_static_metadata(
         eclass,
-        "OpenCL NV12 Filter",
+        "OpenCL NV12 Shader",
         "Filter/Video",
         "Applies OpenCL processing on NV12 video",
-        "Dhruv Prajapati");
+        "eInfochips-Leica");
 
-    gclass->set_property = gst_opencl_filter_set_property;
-    gclass->get_property = gst_opencl_filter_get_property;
+    gclass->set_property = gst_ocl_shader_set_property;
+    gclass->get_property = gst_ocl_shader_get_property;
 
     g_object_class_install_property(
         gclass,
@@ -464,7 +498,7 @@ gst_opencl_filter_class_init(GstOpenCLFilterClass *klass)
             "kernel-file",
             "OpenCL kernel file",
             "Path to OpenCL kernel file (.cl). "
-            "If not set, filter runs in bypass mode.",
+            "If not set, shader runs in bypass mode.",
             NULL,  /* default */
             G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
@@ -474,31 +508,32 @@ gst_opencl_filter_class_init(GstOpenCLFilterClass *klass)
         g_param_spec_string(
             "kernel-func",
             "OpenCL kernel function",
-            "Kernel function name inside the OpenCL program",
-            NULL,
+            "Kernel function name inside the OpenCL program. "
+            "If not set, shader runs in bypass mode.",
+            NULL, /* default */
             G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
 }
 
-/* ================= PLUGIN ================= */
+/* Plugin entry point */
 static gboolean
 plugin_init(GstPlugin *plugin)
 {
     return gst_element_register(plugin,
-                                "openclfilter",
+                                "oscaroclshader",
                                 GST_RANK_NONE,
-                                GST_TYPE_OPENCL_FILTER);
+                                GST_TYPE_OCL_SHADER);
 }
 
+/* Define plugin */
 GST_PLUGIN_DEFINE(
     GST_VERSION_MAJOR,
     GST_VERSION_MINOR,
-    openclfilter,
-    "OpenCL NV12 filter",
+    oscaroclshader,
+    "OpenCL NV12 shader",
     plugin_init,
     VERSION,
     "LGPL",
     PACKAGE,
     PACKAGE
 )
-
