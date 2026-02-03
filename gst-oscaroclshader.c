@@ -260,12 +260,21 @@ gst_ocl_shader_transform_frame(GstVideoFilter *filter,
         self->stride = stride;
     }
 
-    /* Cleanup old events */
-    if (self->write_evt[idx])  clReleaseEvent(self->write_evt[idx]);
-    if (self->kernel_evt[idx]) clReleaseEvent(self->kernel_evt[idx]);
-    if (self->read_evt[idx])   clReleaseEvent(self->read_evt[idx]);
+    /* Release previous events for this slot */
+    if (self->write_evt[idx]) {
+        clReleaseEvent(self->write_evt[idx]);
+        self->write_evt[idx] = NULL;
+    }
+    if (self->kernel_evt[idx]) {
+        clReleaseEvent(self->kernel_evt[idx]);
+        self->kernel_evt[idx] = NULL;
+    }
+    if (self->read_evt[idx]) {
+        clReleaseEvent(self->read_evt[idx]);
+        self->read_evt[idx] = NULL;
+    }
 
-    /* Non-blocking write */
+    /* Async write */
     err = clEnqueueWriteBuffer(self->queue,
                                self->ybuf[idx], CL_FALSE,
                                0, size, y,
@@ -286,7 +295,7 @@ gst_ocl_shader_transform_frame(GstVideoFilter *filter,
 
     GST_DEBUG_OBJECT(self, "Enqueue kernel global=(%zu x %zu)", global[0], global[1]);
 
-    /* Kernel depends on write */
+    /* Kernel waits for write */
     err = clEnqueueNDRangeKernel(self->queue,
                                  self->kernel,
                                  2, NULL,
@@ -295,10 +304,8 @@ gst_ocl_shader_transform_frame(GstVideoFilter *filter,
                                  &self->kernel_evt[idx]);
     CHECK_CL(err, "clEnqueueNDRangeKernel");
 
-    err = clFinish(self->queue);
-    CHECK_CL(err, "clFinish");
 
-    /* Read depends on kernel */
+    /* Read waits for kernel */
     err = clEnqueueReadBuffer(self->queue,
                               self->ybuf[idx], CL_FALSE,
                               0, size, y,
@@ -306,8 +313,13 @@ gst_ocl_shader_transform_frame(GstVideoFilter *filter,
                                 &self->read_evt[idx]);
     CHECK_CL(err, "clEnqueueReadBuffer");
 
-    /* Allow GPU to run asynchronously */
-    clFlush(self->queue);
+    /* Wait ONLY for this frame to complete */
+    clWaitForEvents(1, &self->read_evt[idx]);
+
+    /* Cleanup events (mandatory) */
+    clReleaseEvent(self->write_evt[idx]);  self->write_evt[idx]  = NULL;
+    clReleaseEvent(self->kernel_evt[idx]); self->kernel_evt[idx] = NULL;
+    clReleaseEvent(self->read_evt[idx]);   self->read_evt[idx]   = NULL;
 
     return GST_FLOW_OK;
 error:
